@@ -1,10 +1,10 @@
-# My Express Clone
+# Express Clone
 
 ---
 
 ## A Lightweight Web Framework for Node.js, Built with TypeScript
 
-**My Express Clone** is an educational project aimed at understanding the inner workings of web frameworks like Express. It provides a foundational set of features for building web applications, emphasizing **Clean Code** and **Clean Architecture** principles, all powered by **TypeScript**.
+**Express Clone** is an educational project aimed at understanding the inner workings of web frameworks like Express. It provides a foundational set of features for building web applications, emphasizing **Clean Code** and **Clean Architecture** principles, all powered by **TypeScript**.
 
 ---
 
@@ -35,16 +35,16 @@ This project was developed to:
 To use this library in your project, install it via npm:
 
 ```bash
-npm install my-express-clone
+npm install mini-express-lib
 # or
-yarn add my-express-clone
+yarn add mini-express-lib
 ```
 
 ---
 
 ## Usage
 
-Here's a quick example of how to use My Express Clone to create a basic web server:
+Here's a quick example of how to use Express Clone to create a basic web server:
 
 ```typescript
 // src/index.ts (Your application file)
@@ -71,7 +71,7 @@ app.use(jsonBodyParser());
 
 // Define a GET route for the homepage
 app.get('/', (req: Request, res: Response) => {
-  res.send('<h1>Welcome to My Express Clone!</h1>');
+  res.send('<h1>Welcome to Express Clone!</h1>');
 });
 
 // Define a GET route with a URL parameter
@@ -100,7 +100,7 @@ app.setErrorHandler(
 
 const PORT = 3000;
 app.listen(PORT, () => {
-  console.log(`My Express Clone server running on http://localhost:${PORT}`);
+  console.log(`Express Clone server running on http://localhost:${PORT}`);
 });
 ```
 
