@@ -3,24 +3,28 @@ import { Request, Response, NextFunction, Middleware } from '../app';
 export function jsonBodyParser(): Middleware {
   return (req: Request, _res: Response, next: NextFunction) => {
     if (
-      req.method === 'POST' ||
-      req.method === 'PUT' ||
-      req.method === 'PATCH'
+      !['POST', 'PUT', 'PATCH'].includes(req.method!) ||
+      req.headers['content-length'] === '0'
     ) {
-      let body = '';
-      req.on('data', (chunk) => {
-        body += chunk.toString();
-      });
-      req.on('end', () => {
-        try {
-          req.body = JSON.parse(body || '{}');
-          next();
-        } catch (error) {
-          next(error);
-        }
-      });
-    } else {
-      next();
+      return next();
     }
+
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on('end', () => {
+      try {
+        req.body = body ? JSON.parse(body) : '{}';
+        next();
+      } catch (error) {
+        next(error);
+      }
+    });
+
+    req.on('error', (err) => {
+      next(err);
+    });
   };
 }

@@ -11,23 +11,23 @@ export type Response = ServerResponse & {
   send: (data: string | object) => void;
   status: (code: number) => Response;
 };
-export type NextFunction = (err?: any) => void;
+export type NextFunction = (err?: any) => void | Promise<void>;
 export type Middleware = (
   req: Request,
   res: Response,
   next: NextFunction
-) => void;
+) => void | Promise<void>;
 export type RouteHandler = (
   req: Request,
   res: Response,
   next: NextFunction
-) => void;
+) => void | Promise<void>;
 export type ErrorMiddleware = (
   err: any,
   req: Request,
   res: Response,
   next: NextFunction
-) => void;
+) => void | Promise<void>;
 
 interface Route {
   method: string;
@@ -120,17 +120,23 @@ export class Application {
 
     let index = 0;
 
-    const next: NextFunction = (err?: any) => {
+    const processNext: NextFunction = async (err?: any) => {
       if (err) {
-        return this.runErrorHandlers(err, enhancedReq, enhancedRes, next);
+        return this.runErrorHandlers(err, enhancedReq, enhancedRes);
+      }
+
+      if (enhancedRes.headersSent) {
+        return;
       }
 
       if (index < handlerStack.length) {
         const currentHandler = handlerStack[index++];
         try {
-          currentHandler(enhancedReq, enhancedRes, next);
+          await Promise.resolve(
+            currentHandler(enhancedReq, enhancedRes, processNext)
+          );
         } catch (handlerErr) {
-          next(handlerErr);
+          processNext(handlerErr);
         }
       } else {
         if (!enhancedRes.headersSent) {
@@ -140,28 +146,39 @@ export class Application {
       }
     };
 
-    next();
+    Promise.resolve(processNext()).catch((err: any) => {
+      this.runErrorHandlers(err, enhancedReq, enhancedRes);
+    });
   }
 
-  private runErrorHandlers(
-    err: any,
-    req: Request,
-    res: Response,
-    _next: NextFunction
-  ): void {
+  private runErrorHandlers(err: any, req: Request, res: Response): void {
     let errorIndex = 0;
-    const nextError: NextFunction = (err?: any) => {
+    const nextErrorMiddleware: NextFunction = (errorFromHandler?: any) => {
+      if (errorFromHandler) {
+        err = errorFromHandler;
+      }
       if (errorIndex < this.errorHandlers.length) {
         const errorHandler = this.errorHandlers[errorIndex++];
-        errorHandler(err, req, res, nextError);
+        try {
+          Promise.resolve(
+            errorHandler(err, req, res, nextErrorMiddleware)
+          ).catch((innerErr) => {
+            console.log('Error within error handler:', innerErr);
+            nextErrorMiddleware(innerErr);
+          });
+        } catch (syncErr) {
+          console.error('Synchronous error within error handler:', syncErr);
+          nextErrorMiddleware(syncErr);
+        }
       } else {
         if (!res.headersSent) {
           res.writeHead(500, { 'content-type': 'text/plain' });
           res.end(`Internal Server Error: ${err?.message || 'Unknown error'}`);
+          console.error(`Final Fallback Error: ${err?.stack || err}`);
         }
       }
     };
-    nextError(err);
+    nextErrorMiddleware(err);
   }
 
   private enhanceResponse(res: Response): void {
