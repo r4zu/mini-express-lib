@@ -1,39 +1,25 @@
 import http, { IncomingMessage, ServerResponse } from 'http';
 import { URL } from 'url';
 
-export type Request = IncomingMessage & {
-  params?: Record<string, string>;
-  query?: Record<string, string | string[]>;
-  body?: any;
-};
-export type Response = ServerResponse & {
-  json: (data: any) => void;
-  send: (data: string | object) => void;
-  status: (code: number) => Response;
-};
-export type NextFunction = (err?: any) => void | Promise<void>;
-export type Middleware = (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => void | Promise<void>;
-export type RouteHandler = (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => void | Promise<void>;
-export type ErrorMiddleware = (
-  err: any,
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => void | Promise<void>;
-
-interface Route {
-  method: string;
-  path: string | RegExp;
-  handlers: (Middleware | RouteHandler)[];
-}
+import {
+  ErrorMiddleware,
+  Middleware,
+  Request,
+  Route,
+  RouteHandler,
+  NextFunction,
+} from './types';
+import { enhanceResponse } from './http-context';
+import {
+  extractParams,
+  parseQueryParams,
+  pathToRegex,
+} from './utils/path-utils';
+import {
+  runErrorMiddlewareStack,
+  runMiddlewareStack,
+} from './middleware-runner';
+import { Router } from './router';
 
 export class Application {
   private routes: Route[] = [];
@@ -45,36 +31,111 @@ export class Application {
     this.server = http.createServer(this.handleRequest.bind(this));
   }
 
-  use(path: string | Middleware, handler?: Middleware): void {
-    if (typeof path === 'string' && handler) {
-      this.middlewares.push((req, res, next) => {
-        const urlPath = new URL(req.url || '/', `http://${req.headers.host}`)
-          .pathname;
-        if (urlPath.startsWith(path)) {
-          handler(req, res, next);
-        } else {
-          next();
-        }
-      });
-    } else if (typeof path === 'function') {
-      this.middlewares.push(path as Middleware);
+  use(arg1: string | Middleware | Router, arg2?: Middleware | Router): void {
+    if (typeof arg1 === 'string') {
+      const pathPrefix =
+        arg1.endsWith('/') && arg1.length > 1 ? arg1.slice(0, -1) : arg1;
+
+      if (typeof arg2 === 'function') {
+        this.middlewares.push((req, res, next) => {
+          const urlPath = new URL(req.url || '/', `http://${req.headers.host}`)
+            .pathname;
+          if (
+            urlPath.startsWith(pathPrefix) ||
+            (pathPrefix === '/' && urlPath === '/')
+          ) {
+            (arg2 as Middleware)(req, res, next);
+          } else {
+            next();
+          }
+        });
+      } else if (arg2 instanceof Router) {
+        const router = arg2;
+        const { routes, middlewares } = router.getRoutesAndMiddlewares();
+
+        middlewares.forEach((middleware) => {
+          this.middlewares.push((req, res, next) => {
+            const urlPath = new URL(
+              req.url || '/',
+              `http://${req.headers.host}`
+            ).pathname;
+            if (
+              urlPath.startsWith(pathPrefix) ||
+              (pathPrefix === '/' && urlPath === '/')
+            ) {
+              const originalUrl = req.url;
+              const originalBaseUrl = (req as any).baseUrl || '';
+
+              (req as any).baseUrl =
+                originalBaseUrl === '/'
+                  ? pathPrefix
+                  : `${originalBaseUrl}${pathPrefix}`;
+              req.url = urlPath.substring(pathPrefix.length) || '/';
+              if (!req.url.startsWith('/')) req.url = '/' + req.url;
+
+              return Promise.resolve(
+                middleware(req, res, async (err?: any) => {
+                  req.url = originalUrl;
+                  (req as any).baseUrl = originalBaseUrl;
+                  await next(err);
+                })
+              );
+            } else {
+              next();
+            }
+          });
+        });
+
+        routes.forEach((route) => {
+          let routerPathSource = route.path.source;
+
+          if (routerPathSource === '^\\/?$') {
+            routerPathSource = '';
+          } else {
+            if (routerPathSource.startsWith('^'))
+              routerPathSource = routerPathSource.slice(1);
+            if (routerPathSource.endsWith('\\/?$'))
+              routerPathSource = routerPathSource.slice(0, -4);
+            else if (routerPathSource.endsWith('$'))
+              routerPathSource = routerPathSource.slice(0, -1);
+            if (routerPathSource.startsWith('\\/'))
+              routerPathSource = routerPathSource.slice(2);
+          }
+
+          const normalizedPathPrefix = pathPrefix === '/' ? '' : pathPrefix;
+
+          const finalCombinedPath = `${normalizedPathPrefix}${
+            routerPathSource ? '/' + routerPathSource : ''
+          }`;
+          const finalRegex = pathToRegex(finalCombinedPath).regex;
+
+          this.addRoute(
+            route.method,
+            finalRegex,
+            route.handlers,
+            route.paramNames
+          );
+        });
+      }
+    } else if (typeof arg1 === 'function') {
+      this.middlewares.push(arg1 as Middleware);
     }
   }
 
   get(path: string, ...handlers: (Middleware | RouteHandler)[]): void {
-    this.routes.push({ method: 'GET', path, handlers });
+    this.addRoute('GET', path, handlers);
   }
 
   post(path: string, ...handlers: (Middleware | RouteHandler)[]): void {
-    this.routes.push({ method: 'POST', path, handlers });
+    this.addRoute('POST', path, handlers);
   }
 
   put(path: string, ...handlers: (Middleware | RouteHandler)[]): void {
-    this.routes.push({ method: 'PUT', path, handlers });
+    this.addRoute('PUT', path, handlers);
   }
 
   delete(path: string, ...handlers: (Middleware | RouteHandler)[]): void {
-    this.routes.push({ method: 'DELETE', path, handlers });
+    this.addRoute('DELETE', path, handlers);
   }
 
   listen(port: number, callback?: () => void): void {
@@ -85,11 +146,36 @@ export class Application {
     this.errorHandlers.push(handler);
   }
 
-  private handleRequest(req: IncomingMessage, res: ServerResponse): void {
-    const enhancedReq = req as Request;
-    const enhancedRes = res as Response;
+  private addRoute(
+    method: string,
+    path: string | RegExp,
+    handlers: (Middleware | RouteHandler)[],
+    paramNames?: string[]
+  ): void {
+    let finalPath: RegExp;
+    let finalParamNames: string[];
 
-    this.enhanceResponse(enhancedRes);
+    if (typeof path === 'string') {
+      const { regex, paramNames: computedParamNames } = pathToRegex(path);
+      finalPath = regex;
+      finalParamNames = computedParamNames;
+    } else {
+      finalPath = path;
+      finalParamNames = paramNames || [];
+    }
+
+    this.routes.push({
+      method,
+      path: finalPath,
+      originalPath: typeof path === 'string' ? path : undefined,
+      handlers,
+      paramNames: finalParamNames || [],
+    });
+  }
+
+  private handleRequest(rawReq: IncomingMessage, rawRes: ServerResponse): void {
+    const req = rawReq as Request;
+    const res = enhanceResponse(rawRes);
 
     const urlPath = new URL(req.url || '/', `http://${req.headers.host}`)
       .pathname;
@@ -100,159 +186,43 @@ export class Application {
 
     for (const route of this.routes) {
       if (route.method === method) {
-        const pathRegex = this.pathToRegex(route.path);
-        const match = urlPath.match(pathRegex);
+        const match = urlPath.match(route.path);
+
         if (match) {
           matchedRoute = route;
-          routeParams = this.extractParams(route.path, match);
+          routeParams = extractParams(route.paramNames, match);
           break;
         }
       }
     }
 
-    enhancedReq.params = routeParams;
-    enhancedReq.query = this.parseQueryParams(req.url || '');
+    req.params = routeParams;
+    req.query = parseQueryParams(req.url || '');
 
     const handlerStack: (Middleware | RouteHandler)[] = [
       ...this.middlewares,
       ...(matchedRoute ? matchedRoute.handlers : []),
     ];
 
-    let index = 0;
-
-    const processNext: NextFunction = async (err?: any) => {
-      if (err) {
-        return this.runErrorHandlers(err, enhancedReq, enhancedRes);
-      }
-
-      if (enhancedRes.headersSent) {
-        return;
-      }
-
-      if (index < handlerStack.length) {
-        const currentHandler = handlerStack[index++];
-        try {
-          await Promise.resolve(
-            currentHandler(enhancedReq, enhancedRes, processNext)
-          );
-        } catch (handlerErr) {
-          processNext(handlerErr);
-        }
-      } else {
-        if (!enhancedRes.headersSent) {
-          enhancedRes.writeHead(404, { 'content-type': 'text/plain' });
-          enhancedRes.end('Not Found');
-        }
-      }
+    const handleError = (err: any) => {
+      runErrorMiddlewareStack(this.errorHandlers, err, req, res);
     };
 
-    Promise.resolve(processNext()).catch((err: any) => {
-      this.runErrorHandlers(err, enhancedReq, enhancedRes);
+    runMiddlewareStack(handlerStack, req, res, handleError).catch((err) => {
+      handleError(err);
     });
-  }
-
-  private runErrorHandlers(err: any, req: Request, res: Response): void {
-    let errorIndex = 0;
-    const nextErrorMiddleware: NextFunction = (errorFromHandler?: any) => {
-      if (errorFromHandler) {
-        err = errorFromHandler;
-      }
-      if (errorIndex < this.errorHandlers.length) {
-        const errorHandler = this.errorHandlers[errorIndex++];
-        try {
-          Promise.resolve(
-            errorHandler(err, req, res, nextErrorMiddleware)
-          ).catch((innerErr) => {
-            console.log('Error within error handler:', innerErr);
-            nextErrorMiddleware(innerErr);
-          });
-        } catch (syncErr) {
-          console.error('Synchronous error within error handler:', syncErr);
-          nextErrorMiddleware(syncErr);
-        }
-      } else {
-        if (!res.headersSent) {
-          res.writeHead(500, { 'content-type': 'text/plain' });
-          res.end(`Internal Server Error: ${err?.message || 'Unknown error'}`);
-          console.error(`Final Fallback Error: ${err?.stack || err}`);
-        }
-      }
-    };
-    nextErrorMiddleware(err);
-  }
-
-  private enhanceResponse(res: Response): void {
-    res.json = (data: any) => {
-      if (!res.headersSent) {
-        res.writeHead(200, { 'content-type': 'application/json' });
-      }
-      res.end(JSON.stringify(data));
-    };
-
-    res.send = (data: string | object) => {
-      if (!res.headersSent) {
-        if (typeof data === 'object') {
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify(data));
-        } else {
-          res.writeHead(200, { 'content-type': 'text/html' });
-          res.end(data);
-        }
-      }
-    };
-
-    res.status = (code: number) => {
-      res.statusCode = code;
-      return res;
-    };
-  }
-
-  private pathToRegex(path: string | RegExp): RegExp {
-    if (path instanceof RegExp) {
-      return path;
-    }
-    const paramNames: string[] = [];
-    const regexPath = path.replace(/:([a-zA-Z0-9_]+)/g, (match, paramName) => {
-      paramNames.push(paramName);
-      return '([^/]+)';
-    });
-    (this as any)._currentParamNames = paramNames;
-    return new RegExp(`^${regexPath}/?$`);
-  }
-
-  private extractParams(
-    path: string | RegExp,
-    match: RegExpMatchArray
-  ): Record<string, string> {
-    const params: Record<string, string> = {};
-    if (path instanceof RegExp) {
-      return params;
-    }
-    const paramNames = (this as any)._currentParamNames || [];
-    for (let i = 0; i < paramNames.length && i + 1 < match.length; i++) {
-      params[paramNames[i]] = match[i + 1];
-    }
-    return params;
-  }
-
-  private parseQueryParams(url: string): Record<string, string | string[]> {
-    const queryParams: Record<string, string | string[]> = {};
-    const urlObj = new URL(url, 'http://example.com');
-    urlObj.searchParams.forEach((value, key) => {
-      if (queryParams[key]) {
-        if (Array.isArray(queryParams[key])) {
-          (queryParams[key] as string[]).push(value);
-        } else {
-          queryParams[key] = [queryParams[key] as string, value];
-        }
-      } else {
-        queryParams[key] = value;
-      }
-    });
-    return queryParams;
   }
 }
 
 export function createApplication(): Application {
   return new Application();
 }
+
+export {
+  Request,
+  Response,
+  NextFunction,
+  Middleware,
+  RouteHandler,
+  ErrorMiddleware,
+} from './types';
